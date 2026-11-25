@@ -189,8 +189,61 @@ $setLid = '5ca83367-6e45-459f-a27b-476b1d01c936'
 & powercfg /setactive SCHEME_CURRENT
 $q = (& powercfg /q SCHEME_CURRENT $subLid $setLid) -join "`n"
 Say '  Applied for AC and DC.'
-Say ''
 
+Say ''
+Say '[ Closing every other suspend entry ]'
+# The lid action is only ONE of several ways Windows can suspend. On machines whose
+# suspend path hangs, every remaining entry is a trap - and they all end in the same
+# "device D3 -> platform power down" sequence that a normal shutdown uses as well.
+$orgFile = Join-Path $pd 'power.orig'
+$SUB_SLEEP = '238C9FA8-0AAD-41ED-83F4-97BE242C8F20'
+$SUB_BTN   = '4F971E89-EEBD-4455-A8DE-9E59040E7347'
+$PWR_SETS = @(
+    @('STANDBYIDLE',   $SUB_SLEEP, '29F6C1DB-86DA-48C5-9FDB-F2B67B1F44DA'),
+    @('HIBERNATEIDLE', $SUB_SLEEP, '9D7815A6-7EE4-497E-8888-515A05F02364'),
+    @('UNATTENDSLEEP', $SUB_SLEEP, '7bc4a2f9-d8fc-4469-b07b-33eb785aaca0'),
+    @('SBUTTONACTION', $SUB_BTN,   '97D6F4A0-C1D8-4E1E-8C2D-5CB8B0B4C0D8'),
+    @('PBUTTONACTION', $SUB_BTN,   '7648EFA3-DD9C-4E3E-B566-50F929386280')
+)
+
+function Get-SchemeValue([string]$sub, [string]$set, [string]$kind) {
+    $root = 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes'
+    $scheme = (Get-ItemProperty $root -Name ActivePowerScheme -EA SilentlyContinue).ActivePowerScheme
+    if (-not $scheme) { return 'unset' }
+    $prop = $kind + 'SettingIndex'
+    $v = (Get-ItemProperty "$root\$scheme\$sub\$set" -Name $prop -EA SilentlyContinue).$prop
+    if ($null -eq $v) { return 'unset' }
+    return [string]$v
+}
+
+if (-not (Test-Path $orgFile)) {
+    $lines = @()
+    $lines += 'hibernate=' + $(if (Test-Path 'C:\hiberfil.sys') { '1' } else { '0' })
+    foreach ($s in $PWR_SETS) {
+        $lines += ($s[0] + '=' + (Get-SchemeValue $s[1] $s[2] 'AC'))
+        $lines += ($s[0] + '_DC=' + (Get-SchemeValue $s[1] $s[2] 'DC'))
+    }
+    [IO.File]::WriteAllLines($orgFile, $lines)
+    Say ('  Original values saved -> ' + $orgFile)
+} else {
+    Say ('  Original values already saved -> ' + $orgFile)
+}
+
+& powercfg /h off | Out-Null
+foreach ($s in $PWR_SETS) {
+    & powercfg /setacvalueindex SCHEME_CURRENT $s[1] $s[2] 0 | Out-Null
+    & powercfg /setdcvalueindex SCHEME_CURRENT $s[1] $s[2] 0 | Out-Null
+}
+& powercfg /setactive SCHEME_CURRENT | Out-Null
+Say '  Hibernation disabled; every timeout / button action set to "do nothing".'
+Say '  Final values:'
+foreach ($s in $PWR_SETS) {
+    $a = Get-SchemeValue $s[1] $s[2] 'AC'
+    $d = Get-SchemeValue $s[1] $s[2] 'DC'
+    Say ('    {0,-15} AC={1,-7} DC={2}' -f $s[0], $a, $d)
+}
+
+Say ''
 $plan = @()
 $plan += 'Sleepify sleep plan'
 $plan += ('Generated : ' + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))

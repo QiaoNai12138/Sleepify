@@ -47,6 +47,51 @@ Say '[4/8] Restoring CPU max (100%) and cooling policy (active) ...'
 & powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR SYSCOOLPOL 1
 & powercfg /setactive SCHEME_CURRENT
 
+# ---- 4b. restore the suspend entries recorded by start.ps1 ----
+Say '[4b/8] Restoring power entries recorded by start.ps1 ...'
+$orgFile = Join-Path $here 'config\power.orig'
+if (Test-Path $orgFile) {
+    $orig = @{}
+    Get-Content $orgFile | ForEach-Object {
+        $i = $_.IndexOf('=')
+        if ($i -gt 0) { $orig[$_.Substring(0, $i).Trim()] = $_.Substring($i + 1).Trim() }
+    }
+    $SUB_SLEEP = '238C9FA8-0AAD-41ED-83F4-97BE242C8F20'
+    $SUB_BTN   = '4F971E89-EEBD-4455-A8DE-9E59040E7347'
+    $PWR_SETS = @(
+        @('STANDBYIDLE',   $SUB_SLEEP, '29F6C1DB-86DA-48C5-9FDB-F2B67B1F44DA'),
+        @('HIBERNATEIDLE', $SUB_SLEEP, '9D7815A6-7EE4-497E-8888-515A05F02364'),
+        @('UNATTENDSLEEP', $SUB_SLEEP, '7bc4a2f9-d8fc-4469-b07b-33eb785aaca0'),
+        @('SBUTTONACTION', $SUB_BTN,   '97D6F4A0-C1D8-4E1E-8C2D-5CB8B0B4C0D8'),
+        @('PBUTTONACTION', $SUB_BTN,   '7648EFA3-DD9C-4E3E-B566-50F929386280')
+    )
+    $root = 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes'
+    $scheme = (Get-ItemProperty $root -Name ActivePowerScheme -EA SilentlyContinue).ActivePowerScheme
+    foreach ($s in $PWR_SETS) {
+        foreach ($kind in @('AC', 'DC')) {
+            $key = if ($kind -eq 'AC') { $s[0] } else { $s[0] + '_DC' }
+            $val = $orig[$key]
+            if (-not $val) { continue }
+            if ($val -eq 'unset') {
+                $prop = $kind + 'SettingIndex'
+                Remove-ItemProperty -Path "$root\$scheme\$($s[1])\$($s[2])" -Name $prop -Force -ErrorAction SilentlyContinue
+                Say ('      ' + $s[0] + ' ' + $kind + ' -> unset')
+            } else {
+                $sw = '/set' + $kind.ToLower() + 'valueindex'
+                & powercfg $sw SCHEME_CURRENT $s[1] $s[2] $val | Out-Null
+                Say ('      ' + $s[0] + ' ' + $kind + ' -> ' + $val)
+            }
+        }
+    }
+    if ($orig['hibernate'] -eq '1') {
+        & powercfg /h on | Out-Null
+        Say '      hibernation re-enabled'
+    }
+    & powercfg /setactive SCHEME_CURRENT | Out-Null
+} else {
+    Say '      no recorded values found - leaving power settings untouched'
+}
+
 # ---- 5. re-enable the automatic maintenance window ----
 Say '[5/8] Re-enabling the automatic maintenance window ...'
 $mk = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance'
