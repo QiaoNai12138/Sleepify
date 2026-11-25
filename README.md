@@ -62,3 +62,10 @@ If your device configuration changes or the tool stops behaving correctly, recon
 ## License
 
 MIT — Copyright (c) QiaoNai12138. See [LICENSE](LICENSE).
+
+## About this project
+
+<!-- TODO: this is my first project — write something here later -->
+
+_Reserved for a personal note. To be written._
+
