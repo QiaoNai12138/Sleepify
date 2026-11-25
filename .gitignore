@@ -1,0 +1,26 @@
+# runtime data (per-machine, never commit)
+config/
+logs/
+*.log
+*.state
+*.old
+
+# build output / release assets
+# binaries (Sleepify.exe, SleepifySetup.exe, sleepify.zip) live on the Releases page, not in git
+*.exe
+*.dll
+*.zip
+
+# C# build output (csc / Visual Studio)
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.pdb
+*.csproj.user
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
