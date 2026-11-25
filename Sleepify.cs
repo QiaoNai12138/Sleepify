@@ -1044,11 +1044,55 @@ namespace Sleepify
             catch (Exception ex) { Log("  psenc ERR " + ex.Message); return ""; }
         }
 
+        static string XmlEsc(string s)
+        {
+            if (s == null) return "";
+            return s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+                    .Replace("\"", "&quot;").Replace("'", "&apos;");
+        }
+
         bool CreateTask()
         {
             string exe = Application.ExecutablePath;
-            int rc = RunHidden("schtasks.exe", "/create /tn \"" + TaskName + "\" /tr \"\\\"" + exe + "\\\" --silent\" /sc ONLOGON /rl HIGHEST /f");
-            Log("task create rc=" + rc + " for " + exe);
+            string sid = "";
+            try { sid = WindowsIdentity.GetCurrent().User.Value; }
+            catch (Exception ex) { Log("task: SID ERR " + ex.Message); }
+            if (sid == null || sid.Length == 0) { Log("task: cannot resolve user SID"); return false; }
+
+            // schtasks /create defaults to DisallowStartIfOnBatteries=true and a PT72H
+            // execution limit: on battery the logon start is silently skipped, and the
+            // process is killed after three days. Register an explicit XML task instead.
+            string xml =
+                "<?xml version=\"1.0\" encoding=\"UTF-16\"?>" +
+                "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">" +
+                "<RegistrationInfo><Description>Sleepify - software sleep watcher</Description></RegistrationInfo>" +
+                "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + XmlEsc(sid) + "</UserId>" +
+                "<Delay>PT5S</Delay></LogonTrigger></Triggers>" +
+                "<Principals><Principal id=\"Author\"><UserId>" + XmlEsc(sid) + "</UserId>" +
+                "<LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>" +
+                "<Settings>" +
+                "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" +
+                "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" +
+                "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" +
+                "<AllowHardTerminate>true</AllowHardTerminate>" +
+                "<StartWhenAvailable>true</StartWhenAvailable>" +
+                "<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>" +
+                "<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>" +
+                "<AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden>" +
+                "<RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun>" +
+                "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>7</Priority>" +
+                "</Settings>" +
+                "<Actions Context=\"Author\"><Exec><Command>" + XmlEsc(exe) + "</Command>" +
+                "<Arguments>--silent</Arguments></Exec></Actions>" +
+                "</Task>";
+
+            string tmp = Path.Combine(Path.GetTempPath(), "sleepify-task.xml");
+            try { File.WriteAllText(tmp, xml, Encoding.Unicode); }
+            catch (Exception ex) { Log("task: xml write ERR " + ex.Message); return false; }
+
+            int rc = RunHidden("schtasks.exe", "/create /tn \"" + TaskName + "\" /xml \"" + tmp + "\" /f");
+            try { File.Delete(tmp); } catch { }
+            Log("task create (xml) rc=" + rc + " for " + exe);
             return rc == 0;
         }
 
