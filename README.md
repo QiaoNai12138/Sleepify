@@ -11,7 +11,6 @@ A solution for Windows devices that cannot sleep or hibernate properly.
 |---|---|
 | Installer (recommended) | `SleepifySetup.exe` |
 | Portable | `sleepify.zip` |
-| Standalone binary | `Sleepify.exe` |
 
 ---
 
@@ -65,7 +64,5 @@ MIT — Copyright (c) QiaoNai12138. See [LICENSE](LICENSE).
 
 ## About this project
 
-<!-- TODO: this is my first project — write something here later -->
-
-_Reserved for a personal note. To be written._
+A solution for Windows devices that cannot sleep, hibernate, or wake up.
 

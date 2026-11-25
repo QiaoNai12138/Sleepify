@@ -10,7 +10,6 @@
 |---|---|
 | 安装器（推荐） | `SleepifySetup.exe` |
 | 免安装版 | `sleepify.zip` |
-| 单文件主程序 | `Sleepify.exe` |
 
 ---
 
@@ -61,7 +60,5 @@ MIT —— Copyright (c) QiaoNai12138，详见 [LICENSE](LICENSE)。
 
 ## 关于这个项目
 
-<!-- 待补充：这是我的第一个项目，想说的话写在下面 -->
-
-_预留位置，待补充。_
+面向无法睡眠/休眠或无法唤醒的 Windows 设备提供的解决方案。
 
