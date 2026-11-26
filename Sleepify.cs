@@ -68,9 +68,19 @@ namespace Sleepify
 
         public static bool Suspend(int pid)
         {
+            int err;
+            return SuspendEx(pid, out err);
+        }
+
+        public static bool SuspendEx(int pid, out int err)
+        {
+            err = 0;
             IntPtr h = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
-            if (h == IntPtr.Zero) return false;
-            int r = NtSuspendProcess(h); CloseHandle(h); return r == 0;
+            if (h == IntPtr.Zero) { err = Marshal.GetLastWin32Error(); return false; }
+            int r = NtSuspendProcess(h);
+            CloseHandle(h);
+            if (r != 0) { err = r; return false; }
+            return true;
         }
         public static bool Resume(int pid)
         {
@@ -125,6 +135,10 @@ namespace Sleepify
     public class MainForm : Form
     {
         const string TaskName = "Sleepify";
+        const string AppVersion = "1.3";
+        // Grace period between the cheap phase (mute + dim) and the expensive one
+        // (freeze / radios / maintenance / CPU). A quick lid reopen costs nothing.
+        const int DOWN_DELAY_MS = 4000;
         const int CPU_CAP = 50;
         const string SUB_PROC = "54533251-82be-4824-96c1-47b60b740d00";
         const string SET_MAXCPU = "bc5038f7-23e0-4960-96da-33abaf5935ec";
@@ -159,6 +173,7 @@ namespace Sleepify
         CheckBox chkKeepWlan;
         CheckBox chkFreezeAll;
         Button btnWhite;
+        Label lblVer;
         int cpuCapLid = 50;
         bool keepWlan = true;
         bool freezeAll = true;
@@ -203,8 +218,9 @@ namespace Sleepify
             configFile = Path.Combine(dataDir, "config.ini");
             whitelistFile = Path.Combine(dataDir, "whitelist.txt");
             RotateLog();
+            Log("=== Sleepify v" + AppVersion + " starting (silent=" + silent + ") ===");
 
-            Text = "\u7761\u7720\u6A21\u62DF\u5668  Sleepify";
+            Text = "\u7761\u7720\u6A21\u62DF\u5668  Sleepify  v" + AppVersion;
             ClientSize = new Size(380, 384);
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
@@ -275,12 +291,21 @@ namespace Sleepify
             pnl.Controls.Add(note);
 
             lbl = new Label();
-            lbl.SetBounds(0, 350, 380, 34);
+            lbl.SetBounds(0, 350, 292, 34);
             lbl.TextAlign = ContentAlignment.MiddleCenter;
             lbl.Font = new Font("Microsoft YaHei UI", 9f);
             lbl.BackColor = Color.FromArgb(20, 20, 20);
             lbl.ForeColor = Color.Gainsboro;
             Controls.Add(lbl);
+
+            lblVer = new Label();
+            lblVer.SetBounds(292, 350, 88, 34);
+            lblVer.TextAlign = ContentAlignment.MiddleRight;
+            lblVer.Font = new Font("Consolas", 8f);
+            lblVer.BackColor = Color.FromArgb(20, 20, 20);
+            lblVer.ForeColor = Color.Gray;
+            lblVer.Text = "v" + AppVersion;
+            Controls.Add(lblVer);
 
             cbCap.SelectedIndex = CapToIndex(cpuCapLid);
             chkKeepWlan.Checked = keepWlan;
@@ -435,9 +460,15 @@ namespace Sleepify
                     lock (gate) { lidGen++; myGen = lidGen; lidClosed = !open; }
                     Log("EVENT lid " + (open ? "OPENED" : "CLOSED") + " data=" + ps.data + " gen=" + myGen);
                     if (!enabled) return;
-                    if (open) ThreadPool.QueueUserWorkItem(delegate (object o) { try { GoUp(); } catch (Exception ex) { Log("GoUp ERR " + ex.Message); } });
+                    if (open)
+                    {
+                        // Tell a possibly still-running GoDown to abort before we restore.
+                        downCancel = true;
+                        ThreadPool.QueueUserWorkItem(delegate (object o) { try { GoUp(); } catch (Exception ex) { Log("GoUp ERR " + ex.Message); } });
+                    }
                     else
                     {
+                        downCancel = false;
                         // Mute right now, before the debounce delay - this is what the user
                         // notices first when the lid closes.
                         preMuteKnown = false;
@@ -873,6 +904,39 @@ namespace Sleepify
             return false;
         }
 
+        // Run an executable directly - no PowerShell spawn. powercfg.exe / sc.exe cost
+        // ~200 ms this way versus 2-4 s through a shell, which matters a lot when the
+        // CPU is still throttled to 5% at wake-up.
+        int RunExe(string file, string args)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo(file, args);
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                using (var p = Process.Start(psi))
+                {
+                    if (!p.WaitForExit(20000)) { try { p.Kill(); } catch { } return -1; }
+                    return p.ExitCode;
+                }
+            }
+            catch (Exception ex) { Log("  exe ERR " + file + ": " + ex.Message); return -1; }
+        }
+
+        void CpuSet(string kind, int value)
+        {
+            if (value < 0) return;
+            string sw = "/set" + kind.ToLowerInvariant() + "valueindex";
+            RunExe("powercfg.exe", sw + " SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX " + value);
+        }
+
+        void CpuSetCool(string kind, int value)
+        {
+            if (value < 0) return;
+            string sw = "/set" + kind.ToLowerInvariant() + "valueindex";
+            RunExe("powercfg.exe", sw + " SCHEME_CURRENT SUB_PROCESSOR SYSCOOLPOL " + value);
+        }
+
         static int ReadCoolPol(string kind)
         {
             try
@@ -985,6 +1049,11 @@ namespace Sleepify
         }
 
         readonly object stateLock = new object();
+        readonly object opLock = new object();
+        volatile bool downCancel = false;
+
+        // True once the lid is back open or GoDown was asked to cancel.
+        bool Cancelled() { return downCancel || !lidClosed; }
         void AppendState(string text)
         {
             lock (stateLock) { try { File.AppendAllText(stateFile, text); } catch { } }
@@ -1263,22 +1332,51 @@ namespace Sleepify
             int myPid = Process.GetCurrentProcess().Id;
             int mySess = Process.GetCurrentProcess().SessionId;
             string sysRoot = Environment.GetFolderPath(Environment.SpecialFolder.Windows).ToLowerInvariant();
-            int n = 0, skipped = 0;
+            int n = 0, skipWin = 0;
+            var skipDeny = new List<string>();
+            var skipWhite = new List<string>();
+            var failed = new List<string>();
+            var freed = new Dictionary<string, int>();
+
             foreach (Process p in Process.GetProcesses())
             {
+                if (Cancelled()) { Log("  freeze loop cancelled early"); break; }
                 try
                 {
                     if (p.Id == myPid || p.Id <= 4) continue;
                     if (p.SessionId != mySess) continue;
+
                     string nm = p.ProcessName + ".exe";
-                    if (DeniedName(nm) || Whitelisted(p.ProcessName)) { skipped++; continue; }
+                    if (DeniedName(nm)) { skipDeny.Add(nm); continue; }
+                    if (Whitelisted(p.ProcessName)) { skipWhite.Add(nm); continue; }
+
                     string path = ProcPath(p.Id);
-                    if (path != null && path.ToLowerInvariant().StartsWith(sysRoot)) { skipped++; continue; }
-                    if (Nat.Suspend(p.Id)) { n++; AppendState("frozen=" + p.Id + "|" + nm + "\n"); }
+                    if (path != null && path.ToLowerInvariant().StartsWith(sysRoot)) { skipWin++; continue; }
+
+                    int err;
+                    if (Nat.SuspendEx(p.Id, out err))
+                    {
+                        n++;
+                        int c; freed.TryGetValue(nm, out c); freed[nm] = c + 1;
+                        AppendState("frozen=" + p.Id + "|" + nm + "\n");
+                    }
+                    else
+                    {
+                        failed.Add(nm + " pid=" + p.Id + " err=" + err + " (0x" + err.ToString("X8") + ")");
+                    }
                 }
-                catch { }
+                catch (Exception ex) { failed.Add("exception: " + ex.Message); }
             }
-            Log("  froze " + n + " process(es), skipped " + skipped + " [freeze-all, whitelist " + whitelist.Count + "]");
+
+            var sb = new StringBuilder();
+            foreach (var kv in freed) sb.Append(kv.Key + " x" + kv.Value + ", ");
+            string freedList = sb.Length > 2 ? sb.ToString(0, sb.Length - 2) : "(none)";
+
+            Log("  froze " + n + " process(es) [freeze-all, whitelist " + whitelist.Count + "]");
+            Log("    frozen  : " + freedList);
+            Log("    skipped : sysroot=" + skipWin + " deny=" + skipDeny.Count + " whitelist=" + skipWhite.Count);
+            if (skipWhite.Count > 0) Log("    white   : " + string.Join(", ", skipWhite.ToArray()));
+            if (failed.Count > 0) Log("    FAILED  : " + string.Join(" | ", failed.ToArray()));
         }
 
         void FreezeForeground(int fg)
@@ -1314,6 +1412,16 @@ namespace Sleepify
 
         void GoDown()
         {
+            lock (opLock)
+            {
+                if (!lidClosed) { Log("  GoDown skipped: lid already open"); return; }
+                try { GoDownCore(); }
+                finally { downCancel = false; }
+            }
+        }
+
+        void GoDownCore()
+        {
             var sw = Stopwatch.StartNew();
             var st = new StringBuilder();
 
@@ -1342,53 +1450,101 @@ namespace Sleepify
                         "cpuDc=" + dcV + "\n" +
                         "radios=1\n");
 
-            // ---------- everything slow runs in parallel, starting right now ----------
-            var workers = new List<Thread>();
-
-            workers.Add(new Thread(delegate ()
+            // ---------- PHASE 1: mute + dim only. Cheap and instantly reversible ----------
+            var dimThread = new Thread(delegate ()
             {
                 try
                 {
+                    if (Cancelled()) { Log("  brightness skipped (cancelled)"); return; }
                     int prev = GetBrightness();
+                    if (Cancelled()) { Log("  brightness skipped after read (cancelled)"); return; }
                     if (prev < 0) { Log("  brightness unavailable -> skip dim"); AppendState("bright=-1\n"); return; }
                     AppendState("bright=" + prev + "\n");   // record BEFORE dimming
                     SetBrightness(0);
                     Log("  brightness -> 0 (was " + prev + ")");
                 }
                 catch (Exception ex) { Log("  bright ERR " + ex.Message); }
-            }));
+            });
+            dimThread.IsBackground = true;
+            dimThread.Start();
+
+            // ---------- grace period ----------
+            // Radios and the process freeze are expensive to undo (a Wi-Fi re-association
+            // alone takes seconds), so nothing irreversible happens before this window ends.
+            Log("  phase 1 = mute + dim; " + (DOWN_DELAY_MS / 1000) + "s grace before freeze / radios");
+            for (int i = 0; i < DOWN_DELAY_MS / 100; i++)
+            {
+                if (Cancelled())
+                {
+                    Log("  cancelled inside the grace period - only mute + dim had been applied");
+                    dimThread.Join(20000);
+                    try { FastRestore(); } catch (Exception ex) { Log("  fast rollback ERR " + ex.Message); }
+                    return;
+                }
+                Thread.Sleep(100);
+            }
+
+            // ---------- PHASE 2: freeze / radios / maintenance / CPU cap ----------
+            var workers = new List<Thread>();
+
             workers.Add(new Thread(delegate ()
             {
-                try { Log("  radios: " + PsCmdEncoded(RadioScriptOff(keepWlan))); }
+                try
+                {
+                    if (Cancelled()) { Log("  radios skipped (cancelled)"); return; }
+                    Log("  radios: " + PsCmdEncoded(RadioScriptOff(keepWlan)));
+                }
                 catch (Exception ex) { Log("  radios ERR " + ex.Message); }
             }));
             workers.Add(new Thread(delegate ()
             {
-                try { if (freezeAll) FreezeAll(); else FreezeForeground(fg); }
+                try
+                {
+                    if (Cancelled()) { Log("  freeze skipped (cancelled)"); return; }
+                    if (freezeAll) FreezeAll(); else FreezeForeground(fg);
+                }
                 catch (Exception ex) { Log("  freeze ERR " + ex.Message); }
             }));
             workers.Add(new Thread(delegate ()
             {
-                try { QuietBackground(); }
+                try
+                {
+                    if (Cancelled()) { Log("  quiet skipped (cancelled)"); return; }
+                    QuietBackground();
+                }
                 catch (Exception ex) { Log("  quiet ERR " + ex.Message); }
             }));
             workers.Add(new Thread(delegate ()
             {
                 try
                 {
-                    PsCmd("powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX " + cpuCapLid + ";" +
-                          "powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX " + cpuCapLid + ";" +
-                          "powercfg /setactive SCHEME_CURRENT");
+                    if (Cancelled()) { Log("  cpu cap skipped (cancelled)"); return; }
+                    CpuSet("AC", cpuCapLid);
+                    CpuSet("DC", cpuCapLid);
+                    RunExe("powercfg.exe", "/setactive SCHEME_CURRENT");
                     Log("  cpu capped to " + cpuCapLid + "% (was " + acV + "/" + dcV + ")");
                 }
                 catch (Exception ex) { Log("  cpu ERR " + ex.Message); }
             }));
             foreach (Thread t in workers) { t.IsBackground = true; t.Start(); }
             foreach (Thread t in workers) t.Join(60000);
-            Log("  GoDown complete in " + sw.ElapsedMilliseconds + " ms");
+            dimThread.Join(30000);
+
+            if (Cancelled())
+            {
+                Log("  GoDown CANCELLED mid-flight (lid reopened) -> fast rollback");
+                try { FastRestore(); } catch (Exception ex) { Log("  fast rollback ERR " + ex.Message); }
+            }
+            else Log("  GoDown complete in " + sw.ElapsedMilliseconds + " ms");
         }
 
         void GoUp()
+        {
+            // Serialised with GoDown: a cancel + rollback has to finish before we restore.
+            lock (opLock) { GoUpCore(); }
+        }
+
+        void GoUpCore()
         {
             var sw = Stopwatch.StartNew();
             string[] lines = null;
@@ -1411,6 +1567,27 @@ namespace Sleepify
                     else if (l.StartsWith("radios=")) radios = true;
                     else if (l.StartsWith("svc=") || l.StartsWith("maint=")) quiet = true;
                 }
+            }
+
+            // Fast close/open: GoDown never ran, so the pre-debounce mute has no state to
+            // restore from. Undo it here or the speakers stay muted.
+            if (lines == null && preMuteKnown)
+            {
+                try { Audio.SetMute(preMutePrev); Log("  mute restored (pre-debounce, no state)"); } catch { }
+                preMuteKnown = false;
+            }
+
+            // Un-throttle FIRST, with direct powercfg.exe calls (~200 ms, no shell spawn).
+            // At 5% every PowerShell spawned afterwards takes many times longer - that is
+            // what used to delay the Wi-Fi radio by 10+ seconds.
+            if (acV >= 0 || dcV >= 0 || coolAc >= 0 || coolDc >= 0)
+            {
+                CpuSet("AC", acV);
+                CpuSet("DC", dcV);
+                CpuSetCool("AC", coolAc);
+                CpuSetCool("DC", coolDc);
+                RunExe("powercfg.exe", "/setactive SCHEME_CURRENT");
+                Log("  cpu restored first (direct powercfg " + acV + "/" + dcV + ")");
             }
 
             // ---------- everything at once ----------
@@ -1436,22 +1613,6 @@ namespace Sleepify
             {
                 try { SetBrightness(bright); Log("  brightness restored to " + bright); }
                 catch (Exception ex) { Log("  bright ERR " + ex.Message); }
-            }));
-
-            if (acV >= 0 || dcV >= 0 || coolAc >= 0 || coolDc >= 0) workers.Add(new Thread(delegate ()
-            {
-                try
-                {
-                    string c = "";
-                    if (acV >= 0) c += "powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX " + acV + ";";
-                    if (dcV >= 0) c += "powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX " + dcV + ";";
-                    if (coolAc >= 0) c += "powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR SYSCOOLPOL " + coolAc + ";";
-                    if (coolDc >= 0) c += "powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR SYSCOOLPOL " + coolDc + ";";
-                    c += "powercfg /setactive SCHEME_CURRENT";
-                    PsCmd(c);
-                    Log("  cpu/cooling restored");
-                }
-                catch (Exception ex) { Log("  cpu ERR " + ex.Message); }
             }));
 
             if (frozen.Count > 0) workers.Add(new Thread(delegate () { ResumeFrozenList(frozen); }));
@@ -1571,16 +1732,85 @@ namespace Sleepify
             Log("  bluetooth on");
         }
 
+        // Emergency restore used when the lid is reopened while GoDown is still running.
+        // Everything slow (services, radios) is kept off the critical path so the machine
+        // is usable within a couple of seconds instead of ~40.
+        void FastRestore()
+        {
+            var sw = Stopwatch.StartNew();
+            string[] lines = null;
+            try { if (File.Exists(stateFile)) lines = File.ReadAllLines(stateFile); } catch { }
+
+            var frozen = new List<string[]>();
+            int bright = -1, acV = -1, dcV = -1;
+            bool muteKnown = false, prevMute = false, radios = false;
+            if (lines != null)
+            {
+                foreach (string l in lines)
+                {
+                    if (l.StartsWith("frozen=")) frozen.Add(l.Substring(7).Split('|'));
+                    else if (l.StartsWith("prevMute=")) { muteKnown = true; prevMute = l.EndsWith("1"); }
+                    else if (l.StartsWith("cpuAc=")) int.TryParse(l.Substring(6), out acV);
+                    else if (l.StartsWith("cpuDc=")) int.TryParse(l.Substring(6), out dcV);
+                    else if (l.StartsWith("bright=")) int.TryParse(l.Substring(7), out bright);
+                    else if (l.StartsWith("radios=")) radios = true;
+                }
+            }
+
+            // 1) instant, native calls
+            ResumeFrozenList(frozen);
+            if (muteKnown) { try { Audio.SetMute(prevMute); Log("    fast: mute restored"); } catch { } }
+            else if (preMuteKnown) { try { Audio.SetMute(preMutePrev); Log("    fast: mute restored (pre-debounce)"); } catch { } }
+            preMuteKnown = false;
+
+            // 2) un-throttle immediately: direct powercfg, ~200 ms, and everything spawned
+            //    afterwards benefits from it.
+            if (acV >= 0 || dcV >= 0)
+            {
+                CpuSet("AC", acV);
+                CpuSet("DC", dcV);
+                RunExe("powercfg.exe", "/setactive SCHEME_CURRENT");
+                Log("    fast: cpu -> " + acV + "/" + dcV);
+            }
+
+            // 3) brightness in one shell call, radios in another, in parallel
+            var t1 = new Thread(delegate ()
+            {
+                try
+                {
+                    if (bright >= 0) { SetBrightness(bright); Log("    fast: brightness -> " + bright); }
+                }
+                catch (Exception ex) { Log("    fast brightness ERR " + ex.Message); }
+            });
+            var t2 = new Thread(delegate ()
+            {
+                try { if (radios) { PsCmdEncoded(RadioScriptOn()); Log("    fast: radios on"); } }
+                catch (Exception ex) { Log("    fast radios ERR " + ex.Message); }
+            });
+            t1.IsBackground = true; t2.IsBackground = true;
+            t1.Start(); t2.Start();
+            t1.Join(30000); t2.Join(30000);
+
+            // 3) background services: detached, must not delay the wake-up
+            if (lines != null)
+            {
+                var t3 = new Thread(delegate () { try { RestoreQuiet(lines); } catch { } });
+                t3.IsBackground = true;
+                t3.Start();
+            }
+
+            try { File.Delete(stateFile); } catch { }
+            Log("  fast rollback done in " + sw.ElapsedMilliseconds + " ms; services restart in background, next lid close starts fresh");
+        }
+
         void RestoreCpu(int acV, int dcV, int coolAc, int coolDc)
         {
             if (acV < 0 && dcV < 0 && coolAc < 0 && coolDc < 0) return;
-            string cmd = "";
-            if (acV >= 0) cmd += "powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX " + acV + ";";
-            if (dcV >= 0) cmd += "powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX " + dcV + ";";
-            if (coolAc >= 0) cmd += "powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR SYSCOOLPOL " + coolAc + ";";
-            if (coolDc >= 0) cmd += "powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR SYSCOOLPOL " + coolDc + ";";
-            cmd += "powercfg /setactive SCHEME_CURRENT";
-            PsCmd(cmd);
+            CpuSet("AC", acV);
+            CpuSet("DC", dcV);
+            CpuSetCool("AC", coolAc);
+            CpuSetCool("DC", coolDc);
+            RunExe("powercfg.exe", "/setactive SCHEME_CURRENT");
             Log("  cpu/cooling restored to " + acV + "/" + dcV + " cool " + coolAc + "/" + coolDc);
         }
     }
