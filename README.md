@@ -64,5 +64,5 @@ MIT — Copyright (c) QiaoNai12138. See [LICENSE](LICENSE).
 
 ## About this project
 
-A solution for Windows devices that cannot sleep, hibernate, or wake up.
+这是我的第一个开源项目，最开始他是为了解决我的松下笔记本合盖后睡死而诞生的，他的运行逻辑由我设计 程序代码由DeepSeek V4.1 Flash编写，不是什么复杂的东西 不过我见过很多笔记本电脑有睡眠休眠相关问题，算是我给出的一个下位替代的解决方案吧，希望能帮到您。
 
