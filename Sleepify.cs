@@ -135,7 +135,7 @@ namespace Sleepify
     public class MainForm : Form
     {
         const string TaskName = "Sleepify";
-        const string AppVersion = "1.3";
+        const string AppVersion = "1.3.1";
         // Grace period between the cheap phase (mute + dim) and the expensive one
         // (freeze / radios / maintenance / CPU). A quick lid reopen costs nothing.
         const int DOWN_DELAY_MS = 4000;
@@ -168,6 +168,8 @@ namespace Sleepify
         bool healthOk = true;
         bool exiting = false;
         IntPtr hLid = IntPtr.Zero;
+        IntPtr lidOwner = IntPtr.Zero;
+        System.Windows.Forms.Timer lidTimer;
         string dataDir, logFile, flagFile, stateFile, declinedFile, configFile, whitelistFile;
         ComboBox cbCap;
         CheckBox chkKeepWlan;
@@ -336,6 +338,14 @@ namespace Sleepify
             // Built-in first-run setup / self-heal (replaces install.cmd entirely)
             healthOk = AutoHeal();
 
+            // Forcing the window handle here is essential in silent mode: without it no
+            // WM_POWERBROADCAST is ever delivered and lid events are lost completely.
+            EnsureLidNotification();
+            lidTimer = new System.Windows.Forms.Timer();
+            lidTimer.Interval = 30000;
+            lidTimer.Tick += delegate { EnsureLidNotification(); };
+            lidTimer.Start();
+
             if (File.Exists(stateFile))
             {
                 Log("found leftover state on startup -> restoring");
@@ -396,9 +406,34 @@ namespace Sleepify
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            Guid g = Nat.GUID_LID;
-            hLid = Nat.RegisterPowerSettingNotification(this.Handle, ref g, 0);
-            Log("lid notification registered handle=" + hLid);
+            lidOwner = IntPtr.Zero;
+            EnsureLidNotification();
+        }
+
+        // Registers (or re-registers) the lid notification for the CURRENT window handle.
+        // In silent mode the form is never shown, so the handle is not created automatically
+        // and OnHandleCreated never fired - that is why lid events were lost entirely.
+        void EnsureLidNotification()
+        {
+            try
+            {
+                IntPtr h = this.Handle;                 // forces creation if needed
+                if (h == IntPtr.Zero) { Log("LID: no window handle available"); return; }
+                if (hLid != IntPtr.Zero && lidOwner == h) return;   // already good
+
+                if (hLid != IntPtr.Zero)
+                {
+                    try { Nat.UnregisterPowerSettingNotification(hLid); } catch { }
+                    hLid = IntPtr.Zero;
+                }
+
+                Guid g = Nat.GUID_LID;
+                hLid = Nat.RegisterPowerSettingNotification(h, ref g, 0);
+                lidOwner = h;
+                if (hLid == IntPtr.Zero) Log("LID: REGISTER FAILED err=" + Marshal.GetLastWin32Error());
+                else Log("lid notification registered handle=" + hLid + " (window=" + h + ")");
+            }
+            catch (Exception ex) { Log("LID register ERR " + ex.Message); }
         }
 
         // Launched by the logon task (--silent): stay out of the way, only show a toast.
